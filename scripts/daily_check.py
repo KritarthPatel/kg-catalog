@@ -31,15 +31,14 @@ def _collect_versions(metadata):
     return versions
 
 
-def _latest_version_str(metadata):
-    """Return the version string of the last entry in the first artifact."""
-    artifacts = metadata.get("artifacts", [])
-    if not artifacts:
-        return None
-    versions = artifacts[0].get("versions", [])
-    if not versions:
-        return None
-    return str(versions[-1].get("version", ""))
+def _artifact_latest_version(metadata, artifact_id):
+    """Return the version string of the last entry for a specific artifact in metadata."""
+    for artifact in metadata.get("artifacts", []):
+        if artifact.get("artifact", "unknown") == artifact_id:
+            versions = artifact.get("versions", [])
+            if versions:
+                return str(versions[-1].get("version", ""))
+    return None
 
 
 def run_daily_check():
@@ -75,7 +74,6 @@ def run_daily_check():
             continue
 
         old_versions = _collect_versions(metadata)
-        old_latest = _latest_version_str(metadata)
 
         log(f"Running {script_name} for {kg_name}...")
         try:
@@ -96,24 +94,26 @@ def run_daily_check():
         added = new_versions - old_versions
 
         if added:
-            new_latest = _latest_version_str(updated_metadata)
-            release_url = None
-            for artifact in updated_metadata.get("artifacts", []):
-                for ver in artifact.get("versions", []):
-                    key = (artifact.get("artifact", ""), str(ver.get("version", "")))
-                    if key in added:
-                        dists = ver.get("distributions", [])
-                        if dists:
-                            release_url = dists[0].get("file")
+            for artifact_id, new_ver_str in sorted(added):
+                old_ver = _artifact_latest_version(metadata, artifact_id)
+                release_url = None
+                for artifact in updated_metadata.get("artifacts", []):
+                    if artifact.get("artifact", "unknown") == artifact_id:
+                        for ver in artifact.get("versions", []):
+                            if str(ver.get("version", "")) == new_ver_str:
+                                dists = ver.get("distributions", [])
+                                if dists:
+                                    release_url = dists[0].get("file")
+                                break
                         break
 
-            payload = build_new_version_payload(
-                kg_name=kg_name,
-                old_version=old_latest or "none",
-                new_version=new_latest or "unknown",
-                release_url=release_url,
-            )
-            notifier.notify(NEW_KG_VERSION, payload)
+                payload = build_new_version_payload(
+                    kg_name=kg_name,
+                    old_version=old_ver or "none",
+                    new_version=new_ver_str,
+                    release_url=release_url,
+                )
+                notifier.notify(NEW_KG_VERSION, payload)
 
 
 if __name__ == "__main__":

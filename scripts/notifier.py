@@ -71,6 +71,13 @@ class WebhookNotifier(Notifier):
         self.secret = secret
 
     def notify(self, event_type, payload):
+        if self.secret and not self.url.lower().startswith("https://"):
+            print(
+                "[NOTIFICATION] Webhook delivery failed: "
+                "HTTPS is required when a webhook secret is configured"
+            )
+            return
+
         body = {
             "event": event_type,
             "payload": payload,

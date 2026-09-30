@@ -63,7 +63,7 @@ for artifact in data.get("artifacts", []):
                     timeout=15,
                 )
                 http_status_code = resp.status_code
-                new_status = "active" if resp.status_code == 200 else "error"
+                new_status = "active" if 200 <= resp.status_code < 300 else "error"
                 if new_status == "error":
                     error_detail = f"HTTP {resp.status_code}"
             except requests.Timeout:

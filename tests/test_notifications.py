@@ -103,6 +103,17 @@ class TestWebhookNotifier(unittest.TestCase):
         notifier.notify(KG_UNAVAILABLE, {"kg_name": "broken"})
 
     @patch("notifier.requests.post")
+    def test_http_with_secret_blocks_delivery(self, mock_post):
+        notifier = WebhookNotifier(
+            url="http://hooks.example.com/notify",
+            secret="s3cret",
+        )
+        payload = {"kg_name": "dblp", "timestamp": "2026-01-01T00:00:00+00:00"}
+        notifier.notify(KG_UNAVAILABLE, payload)
+
+        mock_post.assert_not_called()
+
+    @patch("notifier.requests.post")
     def test_no_secret_header_when_unset(self, mock_post):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
