@@ -1,12 +1,13 @@
 """
-Unit tests for the KG Catalog notification system.
+Unit and integration tests for the KG Catalog notification system.
 
 Covers:
   - Notifier construction via get_notifier()
-  - KG_UNAVAILABLE notification on HTTP 404 and timeout
-  - NEW_KG_VERSION notification when metadata versions change
-  - WebhookNotifier delivery and error resilience
-  - CompositeNotifier fan-out behaviour
+  - WebhookNotifier delivery, secret security over HTTP, and error resilience
+  - CompositeNotifier fan-out behavior
+  - Payload builder structures
+  - Integration with production check_url_and_update_yaml()
+  - Integration with production run_daily_check()
 """
 
 import json
@@ -16,7 +17,7 @@ import tempfile
 import textwrap
 import unittest
 from io import StringIO
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 # Ensure the scripts/ directory is importable
 sys.path.insert(
@@ -24,6 +25,10 @@ sys.path.insert(
     os.path.join(os.path.dirname(__file__), "..", "scripts"),
 )
 
+import requests
+import yaml
+from check_url_update_yaml import check_url_and_update_yaml
+from daily_check import run_daily_check
 from notifier import (
     KG_UNAVAILABLE,
     NEW_KG_VERSION,
@@ -94,9 +99,7 @@ class TestWebhookNotifier(unittest.TestCase):
     @patch("notifier.requests.post")
     def test_delivery_failure_does_not_raise(self, mock_post):
         """A failing webhook must NEVER crash the caller."""
-        import requests as real_requests
-
-        mock_post.side_effect = real_requests.ConnectionError("refused")
+        mock_post.side_effect = requests.ConnectionError("refused")
 
         notifier = WebhookNotifier(url="https://hooks.example.com/notify")
         # This must NOT raise
@@ -104,6 +107,7 @@ class TestWebhookNotifier(unittest.TestCase):
 
     @patch("notifier.requests.post")
     def test_http_with_secret_blocks_delivery(self, mock_post):
+        """Webhooks configured with a secret must reject insecure HTTP URLs."""
         notifier = WebhookNotifier(
             url="http://hooks.example.com/notify",
             secret="s3cret",
@@ -122,7 +126,7 @@ class TestWebhookNotifier(unittest.TestCase):
         notifier = WebhookNotifier(url="https://hooks.example.com/notify")
         notifier.notify(NEW_KG_VERSION, {"kg_name": "test"})
 
-        _, kwargs = mock_post.call_args
+        args, kwargs = mock_post.call_args
         self.assertNotIn("X-Webhook-Secret", kwargs["headers"])
 
 
@@ -131,53 +135,51 @@ class TestWebhookNotifier(unittest.TestCase):
 # --------------------------------------------------
 
 class TestCompositeNotifier(unittest.TestCase):
-    """Verify CompositeNotifier fans out and isolates backend errors."""
+    """Verify CompositeNotifier delegates to all sub-notifiers."""
 
-    def test_calls_all_backends(self):
-        mock_a = MagicMock()
-        mock_b = MagicMock()
-        composite = CompositeNotifier([mock_a, mock_b])
+    def test_fan_out(self):
+        n1 = MagicMock()
+        n2 = MagicMock()
+        composite = CompositeNotifier([n1, n2])
 
-        composite.notify(KG_UNAVAILABLE, {"kg_name": "x"})
+        composite.notify(KG_UNAVAILABLE, {"kg_name": "test"})
 
-        mock_a.notify.assert_called_once()
-        mock_b.notify.assert_called_once()
+        n1.notify.assert_called_once()
+        n2.notify.assert_called_once()
 
-    def test_one_failure_does_not_block_others(self):
-        failing = MagicMock()
-        failing.notify.side_effect = RuntimeError("boom")
-        succeeding = MagicMock()
+    def test_one_failing_backend_does_not_stop_others(self):
+        n1 = MagicMock()
+        n1.notify.side_effect = RuntimeError("Boom")
+        n2 = MagicMock()
 
-        composite = CompositeNotifier([failing, succeeding])
-        composite.notify(KG_UNAVAILABLE, {"kg_name": "x"})
+        composite = CompositeNotifier([n1, n2])
+        composite.notify(KG_UNAVAILABLE, {"kg_name": "test"})
 
-        # The second backend must still have been called
-        succeeding.notify.assert_called_once()
+        n2.notify.assert_called_once()
 
 
 # --------------------------------------------------
-# get_notifier() factory
+# Factory: get_notifier()
 # --------------------------------------------------
 
 class TestGetNotifier(unittest.TestCase):
-    """Verify the factory builds the right notifier stack."""
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_default_is_log_notifier(self):
-        n = get_notifier()
-        self.assertIsInstance(n, LogNotifier)
+    def test_default_returns_log_notifier(self):
+        notifier = get_notifier()
+        self.assertIsInstance(notifier, LogNotifier)
 
     @patch.dict(
         os.environ,
         {"NOTIFICATION_WEBHOOK_URL": "https://example.com/hook"},
         clear=True,
     )
-    def test_webhook_env_creates_composite(self):
-        n = get_notifier()
-        self.assertIsInstance(n, CompositeNotifier)
-        self.assertEqual(len(n.notifiers), 2)
-        self.assertIsInstance(n.notifiers[0], LogNotifier)
-        self.assertIsInstance(n.notifiers[1], WebhookNotifier)
+    def test_returns_composite_with_webhook(self):
+        notifier = get_notifier()
+        self.assertIsInstance(notifier, CompositeNotifier)
+        self.assertEqual(len(notifier.notifiers), 2)
+        self.assertIsInstance(notifier.notifiers[0], LogNotifier)
+        self.assertIsInstance(notifier.notifiers[1], WebhookNotifier)
 
 
 # --------------------------------------------------
@@ -230,17 +232,15 @@ class TestPayloadBuilders(unittest.TestCase):
 
 
 # --------------------------------------------------
-# Integration: check_url_update_yaml with mocked HTTP
+# Integration: Production check_url_and_update_yaml
 # --------------------------------------------------
 
-class TestCheckUrlIntegration(unittest.TestCase):
+class TestCheckUrlProductionIntegration(unittest.TestCase):
     """
-    End-to-end test of check_url_update_yaml.py logic:
-    a distribution URL returning 404 must trigger KG_UNAVAILABLE.
+    Test production check_url_and_update_yaml function with mock HTTP requests.
     """
 
     def _write_yaml(self, tmp_dir, yaml_content):
-        """Write a YAML file inside a kg-named subdirectory."""
         kg_dir = os.path.join(tmp_dir, "test-kg")
         os.makedirs(kg_dir, exist_ok=True)
         path = os.path.join(kg_dir, "metadata.yaml")
@@ -248,8 +248,17 @@ class TestCheckUrlIntegration(unittest.TestCase):
             f.write(yaml_content)
         return path
 
-    @patch("notifier.requests.post")
-    def test_404_triggers_kg_unavailable(self, _mock_webhook):
+    @patch("check_url_update_yaml.requests.head")
+    @patch("check_url_update_yaml.get_notifier")
+    def test_active_url_changing_to_error_triggers_kg_unavailable(self, mock_get_notifier, mock_head):
+        """Active URL returning HTTP 404 updates status to error and fires KG_UNAVAILABLE."""
+        mock_notifier = MagicMock()
+        mock_get_notifier.return_value = mock_notifier
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_head.return_value = mock_resp
+
         yaml_content = textwrap.dedent("""\
             artifacts:
               - artifact: test-artifact
@@ -257,62 +266,36 @@ class TestCheckUrlIntegration(unittest.TestCase):
                   - version: "2025-01-01"
                     distributions:
                       - file: https://example.com/dead-link.nt.gz
-                        status: pending
+                        status: active
         """)
 
         with tempfile.TemporaryDirectory() as tmp:
             yaml_path = self._write_yaml(tmp, yaml_content)
 
-            mock_notifier = MagicMock()
+            check_url_and_update_yaml(yaml_path)
 
-            mock_resp = MagicMock()
-            mock_resp.status_code = 404
+            mock_notifier.notify.assert_called_once()
+            call_args = mock_notifier.notify.call_args
+            self.assertEqual(call_args[0][0], KG_UNAVAILABLE)
+            self.assertEqual(call_args[0][1]["kg_name"], "test-kg")
+            self.assertEqual(call_args[0][1]["status_code"], 404)
+            self.assertIn("dead-link.nt.gz", call_args[0][1]["url"])
 
-            with patch("sys.argv", ["check_url_update_yaml.py", yaml_path]), \
-                 patch.dict(os.environ, {}, clear=False), \
-                 patch("notifier.get_notifier", return_value=mock_notifier):
+            # Verify YAML status was updated to error
+            with open(yaml_path, "r") as f:
+                updated_data = yaml.safe_load(f)
+            dist_status = updated_data["artifacts"][0]["versions"][0]["distributions"][0]["status"]
+            self.assertEqual(dist_status, "error")
 
-                import yaml as _yaml
-                import requests as _requests
+    @patch("check_url_update_yaml.requests.head")
+    @patch("check_url_update_yaml.get_notifier")
+    def test_request_timeout_triggers_kg_unavailable(self, mock_get_notifier, mock_head):
+        """A network timeout updates status to error and fires KG_UNAVAILABLE."""
+        mock_notifier = MagicMock()
+        mock_get_notifier.return_value = mock_notifier
 
-                with open(yaml_path, "r") as f:
-                    data = _yaml.safe_load(f)
+        mock_head.side_effect = requests.Timeout("Connection timed out")
 
-                kg_name = os.path.basename(os.path.dirname(yaml_path))
-
-                for artifact in data.get("artifacts", []):
-                    for version in artifact.get("versions", []):
-                        for dist in version.get("distributions", []):
-                            url = dist.get("file")
-                            if not url:
-                                continue
-                            status = dist.get("status", "pending")
-                            if status == "active":
-                                continue
-
-                            new_status = "error"
-                            error_detail = "HTTP 404"
-                            http_status_code = 404
-
-                            if status != new_status and new_status == "error":
-                                payload = build_kg_unavailable_payload(
-                                    kg_name=kg_name,
-                                    url=url,
-                                    error=error_detail,
-                                    status_code=http_status_code,
-                                )
-                                mock_notifier.notify(KG_UNAVAILABLE, payload)
-
-                mock_notifier.notify.assert_called_once()
-                call_args = mock_notifier.notify.call_args
-                self.assertEqual(call_args[0][0], KG_UNAVAILABLE)
-                self.assertEqual(call_args[0][1]["kg_name"], "test-kg")
-                self.assertEqual(call_args[0][1]["status_code"], 404)
-                self.assertIn("dead-link.nt.gz", call_args[0][1]["url"])
-
-    @patch("notifier.requests.post")
-    def test_timeout_triggers_kg_unavailable(self, _mock_webhook):
-        """A network timeout must also fire KG_UNAVAILABLE."""
         yaml_content = textwrap.dedent("""\
             artifacts:
               - artifact: test-artifact
@@ -325,102 +308,146 @@ class TestCheckUrlIntegration(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             yaml_path = self._write_yaml(tmp, yaml_content)
-            mock_notifier = MagicMock()
 
-            import yaml as _yaml
-
-            with open(yaml_path, "r") as f:
-                data = _yaml.safe_load(f)
-
-            kg_name = os.path.basename(os.path.dirname(yaml_path))
-
-            for artifact in data.get("artifacts", []):
-                for version in artifact.get("versions", []):
-                    for dist in version.get("distributions", []):
-                        url = dist.get("file")
-                        status = dist.get("status", "pending")
-                        if status == "active":
-                            continue
-
-                        new_status = "error"
-                        error_detail = "Request timed out"
-
-                        if status != new_status and new_status == "error":
-                            payload = build_kg_unavailable_payload(
-                                kg_name=kg_name,
-                                url=url,
-                                error=error_detail,
-                            )
-                            mock_notifier.notify(KG_UNAVAILABLE, payload)
+            check_url_and_update_yaml(yaml_path)
 
             mock_notifier.notify.assert_called_once()
             call_args = mock_notifier.notify.call_args
+            self.assertEqual(call_args[0][0], KG_UNAVAILABLE)
             self.assertEqual(call_args[0][1]["error"], "Request timed out")
             self.assertNotIn("status_code", call_args[0][1])
 
+    @patch("check_url_update_yaml.requests.head")
+    @patch("check_url_update_yaml.get_notifier")
+    def test_no_duplicate_alert_when_status_remains_error(self, mock_get_notifier, mock_head):
+        """If a URL was already error and remains error, no duplicate alert is sent."""
+        mock_notifier = MagicMock()
+        mock_get_notifier.return_value = mock_notifier
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_head.return_value = mock_resp
+
+        yaml_content = textwrap.dedent("""\
+            artifacts:
+              - artifact: test-artifact
+                versions:
+                  - version: "2025-01-01"
+                    distributions:
+                      - file: https://example.com/broken.nt.gz
+                        status: error
+        """)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            yaml_path = self._write_yaml(tmp, yaml_content)
+
+            check_url_and_update_yaml(yaml_path)
+
+            mock_notifier.notify.assert_not_called()
+
 
 # --------------------------------------------------
-# Integration: new-version detection
+# Integration: Production run_daily_check
 # --------------------------------------------------
 
-class TestNewVersionDetection(unittest.TestCase):
-    """Verify _collect_versions detects newly appended versions."""
+class TestDailyCheckProductionIntegration(unittest.TestCase):
+    """
+    Test production run_daily_check function with temporary KG directories.
+    """
 
-    def test_detects_added_version(self):
-        def _collect_versions(metadata):
-            versions = set()
-            for artifact in metadata.get("artifacts", []):
-                artifact_id = artifact.get("artifact", "unknown")
-                for ver in artifact.get("versions", []):
-                    versions.add((artifact_id, str(ver.get("version", ""))))
-            return versions
+    @patch("daily_check.subprocess.run")
+    @patch("daily_check.get_notifier")
+    def test_added_version_triggers_new_kg_version(self, mock_get_notifier, mock_subproc):
+        """Detecting a new version during run_daily_check fires NEW_KG_VERSION."""
+        mock_notifier = MagicMock()
+        mock_get_notifier.return_value = mock_notifier
 
-        old_meta = {
-            "artifacts": [{
-                "artifact": "monthly-snapshot",
-                "versions": [
-                    {"version": "2025-10-01"},
-                ],
-            }],
-        }
+        initial_yaml = textwrap.dedent("""\
+            check-new-release: check.py
+            artifacts:
+              - artifact: snapshot
+                versions:
+                  - version: "2025-10-01"
+                    distributions:
+                      - file: https://example.com/v1.nt.gz
+        """)
 
-        new_meta = {
-            "artifacts": [{
-                "artifact": "monthly-snapshot",
-                "versions": [
-                    {"version": "2025-10-01"},
-                    {"version": "2025-11-01"},
-                ],
-            }],
-        }
+        updated_yaml = textwrap.dedent("""\
+            check-new-release: check.py
+            artifacts:
+              - artifact: snapshot
+                versions:
+                  - version: "2025-10-01"
+                    distributions:
+                      - file: https://example.com/v1.nt.gz
+                  - version: "2025-11-01"
+                    distributions:
+                      - file: https://example.com/v2.nt.gz
+        """)
 
-        old_v = _collect_versions(old_meta)
-        new_v = _collect_versions(new_meta)
-        added = new_v - old_v
+        with tempfile.TemporaryDirectory() as tmp_root:
+            kg_dir = os.path.join(tmp_root, "knowledge-graphs", "test-kg")
+            os.makedirs(kg_dir)
 
-        self.assertEqual(len(added), 1)
-        self.assertIn(("monthly-snapshot", "2025-11-01"), added)
+            metadata_path = os.path.join(kg_dir, "metadata.yaml")
+            script_path = os.path.join(kg_dir, "check.py")
 
-    def test_no_change_detected_when_same(self):
-        def _collect_versions(metadata):
-            versions = set()
-            for artifact in metadata.get("artifacts", []):
-                artifact_id = artifact.get("artifact", "unknown")
-                for ver in artifact.get("versions", []):
-                    versions.add((artifact_id, str(ver.get("version", ""))))
-            return versions
+            with open(metadata_path, "w") as f:
+                f.write(initial_yaml)
+            with open(script_path, "w") as f:
+                f.write("# dummy script\n")
 
-        meta = {
-            "artifacts": [{
-                "artifact": "snapshot",
-                "versions": [{"version": "2025-10-01"}],
-            }],
-        }
+            # Simulate subprocess updating the metadata.yaml
+            def side_effect(*args, **kwargs):
+                with open(metadata_path, "w") as f:
+                    f.write(updated_yaml)
 
-        self.assertEqual(
-            _collect_versions(meta) - _collect_versions(meta),
-            set(),
-        )
+            mock_subproc.side_effect = side_effect
+
+            with patch("daily_check.KGS_ROOT", os.path.join(tmp_root, "knowledge-graphs")), \
+                 patch("daily_check.notifier", mock_notifier):
+                run_daily_check()
+
+            mock_notifier.notify.assert_called_once()
+            event, payload = mock_notifier.notify.call_args[0]
+            self.assertEqual(event, NEW_KG_VERSION)
+            self.assertEqual(payload["kg_name"], "test-kg")
+            self.assertEqual(payload["old_version"], "2025-10-01")
+            self.assertEqual(payload["new_version"], "2025-11-01")
+            self.assertEqual(payload["release_url"], "https://example.com/v2.nt.gz")
+
+    @patch("daily_check.subprocess.run")
+    @patch("daily_check.get_notifier")
+    def test_unchanged_metadata_produces_no_version_alert(self, mock_get_notifier, mock_subproc):
+        """When check script produces no new version, no notification is sent."""
+        mock_notifier = MagicMock()
+        mock_get_notifier.return_value = mock_notifier
+
+        initial_yaml = textwrap.dedent("""\
+            check-new-release: check.py
+            artifacts:
+              - artifact: snapshot
+                versions:
+                  - version: "2025-10-01"
+        """)
+
+        with tempfile.TemporaryDirectory() as tmp_root:
+            kg_dir = os.path.join(tmp_root, "knowledge-graphs", "test-kg")
+            os.makedirs(kg_dir)
+
+            metadata_path = os.path.join(kg_dir, "metadata.yaml")
+            script_path = os.path.join(kg_dir, "check.py")
+
+            with open(metadata_path, "w") as f:
+                f.write(initial_yaml)
+            with open(script_path, "w") as f:
+                f.write("# dummy script\n")
+
+            with patch("daily_check.KGS_ROOT", os.path.join(tmp_root, "knowledge-graphs")), \
+                 patch("daily_check.notifier", mock_notifier):
+                run_daily_check()
+
+            mock_notifier.notify.assert_not_called()
 
 
 if __name__ == "__main__":

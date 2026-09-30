@@ -10,7 +10,6 @@ from notifier import (
     build_new_version_payload,
 )
 
-# Path to the folder containing all KG folders
 KGS_ROOT = os.path.join(os.path.dirname(__file__), "..", "knowledge-graphs")
 
 notifier = get_notifier()
@@ -22,7 +21,7 @@ def log(msg):
 
 
 def _collect_versions(metadata):
-    """Return a set of all (artifact_id, version) tuples in the metadata."""
+    """Return a set of all (artifact_id, version) tuples in metadata."""
     versions = set()
     for artifact in metadata.get("artifacts", []):
         artifact_id = artifact.get("artifact", "unknown")
