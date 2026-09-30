@@ -1,8 +1,19 @@
+import os
 import yaml
 import requests
 import sys
 
+from notifier import (
+    get_notifier,
+    KG_UNAVAILABLE,
+    build_kg_unavailable_payload,
+)
+
 yaml_file = sys.argv[1]
+
+_kg_name = os.path.basename(os.path.dirname(os.path.abspath(yaml_file)))
+
+notifier = get_notifier()
 
 # --- Step 1: Validate YAML syntax ---
 try:
@@ -41,16 +52,26 @@ for artifact in data.get("artifacts", []):
                 print(f"✅ Skipping {url}: already active")
                 continue
 
+            error_detail = None
+            http_status_code = None
+
             try:
                 resp = requests.head(
                     url,
                     headers=REQUEST_HEADERS,
                     allow_redirects=True,
-                    timeout=10,
+                    timeout=15,
                 )
+                http_status_code = resp.status_code
                 new_status = "active" if resp.status_code == 200 else "error"
-            except requests.RequestException:
+                if new_status == "error":
+                    error_detail = f"HTTP {resp.status_code}"
+            except requests.Timeout:
                 new_status = "error"
+                error_detail = "Request timed out"
+            except requests.RequestException as exc:
+                new_status = "error"
+                error_detail = str(exc)
 
             if status != new_status:
                 print(f"🔄 Updating {url}: {status} -> {new_status}")
@@ -59,6 +80,14 @@ for artifact in data.get("artifacts", []):
                 # Trigger Databus publish if URL became active
                 if new_status == "active":
                     publish_triggered = True
+                if new_status == "error":
+                    payload = build_kg_unavailable_payload(
+                        kg_name=_kg_name,
+                        url=url,
+                        error=error_detail or "Unknown error",
+                        status_code=http_status_code,
+                    )
+                    notifier.notify(KG_UNAVAILABLE, payload)
             else:
                 print(f"ℹ️ No change for {url} (still {status})")
 
